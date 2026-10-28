@@ -21,7 +21,7 @@ import re
 import secrets
 import sqlite3
 import time
-from datetime import date, datetime, time as dt_time, timezone
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -40,9 +40,18 @@ from flask import (
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from markupsafe import Markup
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
+from docx import Document
+from docx.enum.section import WD_ORIENT
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Cm, Pt, RGBColor
+from reportlab.lib import colors as rl_colors
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from xml.sax.saxutils import escape as xml_escape
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -2206,6 +2215,9 @@ def init_db() -> None:
 init_db()
 
 
+IST = timezone(timedelta(hours=5, minutes=30), "IST")
+
+
 def utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -2232,7 +2244,7 @@ def format_local(value, include_zone: bool = True) -> str:
     parsed = parse_db_datetime(value)
     if parsed is None:
         return "No responses yet"
-    local = parsed.replace(tzinfo=timezone.utc).astimezone()
+    local = parsed.replace(tzinfo=timezone.utc).astimezone(IST)
     pattern = "%d %b %Y, %I:%M %p %Z" if include_zone else "%Y-%m-%d %H:%M:%S"
     return local.strftime(pattern)
 
@@ -2241,16 +2253,16 @@ def format_local_date(value) -> str:
     parsed = parse_db_datetime(value)
     if parsed is None:
         return ""
-    return parsed.replace(tzinfo=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    return parsed.replace(tzinfo=timezone.utc).astimezone(IST).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def local_date_start_utc(value: date) -> str:
-    local = datetime.combine(value, dt_time.min).astimezone()
+    local = datetime.combine(value, dt_time.min, tzinfo=IST)
     return local.astimezone(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def local_date_end_utc(value: date) -> str:
-    local = datetime.combine(value, dt_time.max).astimezone()
+    local = datetime.combine(value, dt_time.max, tzinfo=IST)
     return local.astimezone(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -2750,7 +2762,7 @@ def spreadsheet_safe(value) -> str:
 
 
 EXPORT_HEADERS = [
-    "Submission time (local)",
+    "Submission time (IST)",
     "Name",
     "Class",
     "Email",
@@ -2813,59 +2825,215 @@ def build_csv(filters: dict) -> bytes:
     return output.getvalue().encode("utf-8-sig")
 
 
-def build_xlsx(filters: dict) -> io.BytesIO:
+EXPORT_COLUMN_WEIGHTS = [
+    1.4, 1.3, 0.7, 1.7, 1.3, 1.4, 1.3, 1.1, 1.1, 1.1, 1.1, 1.1, 1.1, 1.3, 1.1, 1.4, 2.1, 0.6,
+]
+
+
+def filters_summary(filters: dict) -> str:
+    parts: list[str] = []
+    if filters.get("q"):
+        parts.append(f'search "{filters["q"]}"')
+    if filters.get("class_level"):
+        parts.append(f"class {filters['class_level']}")
+    if filters.get("preferred_breakfast"):
+        parts.append(f"preferred breakfast {filters['preferred_breakfast']}")
+    if filters.get("breakfast_frequency"):
+        parts.append(f"frequency {filters['breakfast_frequency']}")
+    if filters.get("date_from"):
+        parts.append(f"from {filters['date_from'].isoformat()}")
+    if filters.get("date_to"):
+        parts.append(f"to {filters['date_to'].isoformat()}")
+    if filters.get("sort") == "oldest":
+        parts.append("oldest first")
+    return "Filters: " + "; ".join(parts) if parts else "Filters: none"
+
+
+def shade_docx_cell(cell, fill: str) -> None:
+    tc_pr = cell._tc.get_or_add_tcPr()
+    shading = OxmlElement("w:shd")
+    shading.set(qn("w:val"), "clear")
+    shading.set(qn("w:color"), "auto")
+    shading.set(qn("w:fill"), fill)
+    tc_pr.append(shading)
+
+
+def build_docx(filters: dict) -> io.BytesIO:
     rows = ordered_rows(filters)
-    workbook = Workbook()
-    sheet = workbook.active
-    sheet.title = "Survey Responses"
-    sheet.sheet_view.showGridLines = False
+    document = Document()
+    section = document.sections[0]
+    section.orientation = WD_ORIENT.LANDSCAPE
+    section.page_width = Cm(29.7)
+    section.page_height = Cm(21.0)
+    for margin in ("left_margin", "right_margin", "top_margin", "bottom_margin"):
+        setattr(section, margin, Cm(1.27))
 
-    header_fill = PatternFill("solid", fgColor="0B2545")
-    header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-    thin_border = Border(
-        left=Side(style="thin", color="D8E7F5"),
-        right=Side(style="thin", color="D8E7F5"),
-        top=Side(style="thin", color="D8E7F5"),
-        bottom=Side(style="thin", color="D8E7F5"),
+    title = document.add_paragraph()
+    title_run = title.add_run("Chemistry IP — Survey Responses")
+    title_run.font.size = Pt(16)
+    title_run.font.bold = True
+    title_run.font.color.rgb = RGBColor(0x0B, 0x25, 0x45)
+
+    meta = document.add_paragraph()
+    meta_run = meta.add_run(
+        f"Generated {format_local(datetime.now(timezone.utc))} · {len(rows)} response(s)"
     )
-    alternate_fill = PatternFill("solid", fgColor="F5F9FF")
+    meta_run.font.size = Pt(8)
+    meta_run.font.color.rgb = RGBColor(0x41, 0x50, 0x6B)
 
-    for column_index, header in enumerate(EXPORT_HEADERS, start=1):
-        cell = sheet.cell(row=1, column=column_index, value=header)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = thin_border
-    sheet.row_dimensions[1].height = 30
+    filter_line = document.add_paragraph()
+    filter_run = filter_line.add_run(filters_summary(filters))
+    filter_run.font.size = Pt(8)
+    filter_run.font.color.rgb = RGBColor(0x41, 0x50, 0x6B)
 
-    for row_index, row in enumerate(rows, start=2):
-        for column_index, value in enumerate(export_row(row), start=1):
-            cell = sheet.cell(
-                row=row_index,
-                column=column_index,
-                value=spreadsheet_safe(value),
-            )
-            cell.number_format = "@"
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-            cell.border = thin_border
-            if row_index % 2 == 0:
-                cell.fill = alternate_fill
+    table = document.add_table(rows=1, cols=len(EXPORT_HEADERS))
+    table.style = "Table Grid"
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.autofit = False
 
-    widths = [24, 24, 14, 32, 20, 24, 22, 22, 22, 22, 20, 24, 22, 28, 22, 32, 46, 16]
-    for column_index, width in enumerate(widths, start=1):
-        sheet.column_dimensions[get_column_letter(column_index)].width = width
+    usable_width = section.page_width - section.left_margin - section.right_margin
+    weight_total = sum(EXPORT_COLUMN_WEIGHTS)
+    column_widths = [
+        int(usable_width * weight / weight_total) for weight in EXPORT_COLUMN_WEIGHTS
+    ]
+    for index, width in enumerate(column_widths):
+        table.columns[index].width = width
 
-    sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = (
-        f"A1:{get_column_letter(len(EXPORT_HEADERS))}{max(1, sheet.max_row)}"
-    )
-    sheet.print_title_rows = "1:1"
-    sheet.page_setup.orientation = "landscape"
-    sheet.page_setup.fitToWidth = 1
-    sheet.sheet_properties.pageSetUpPr.fitToPage = True
+    header_cells = table.rows[0].cells
+    header_row = table.rows[0]
+    tr_pr = header_row._tr.get_or_add_trPr()
+    repeat = OxmlElement("w:tblHeader")
+    repeat.set(qn("w:val"), "true")
+    tr_pr.append(repeat)
+    for index, header in enumerate(EXPORT_HEADERS):
+        cell = header_cells[index]
+        cell.width = column_widths[index]
+        shade_docx_cell(cell, "0B2545")
+        paragraph = cell.paragraphs[0]
+        run = paragraph.add_run(header)
+        run.font.size = Pt(7)
+        run.font.bold = True
+        run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+
+    if not rows:
+        empty_row = table.add_row()
+        empty_cell = empty_row.cells[0]
+        empty_cell.merge(empty_row.cells[-1])
+        empty_run = empty_cell.paragraphs[0].add_run(
+            "No survey responses match the current filters."
+        )
+        empty_run.font.size = Pt(8)
+    else:
+        for row_index, row in enumerate(rows):
+            cells = table.add_row().cells
+            row_cant_split = OxmlElement("w:cantSplit")
+            table.rows[-1]._tr.get_or_add_trPr().append(row_cant_split)
+            for cell_index, value in enumerate(export_row(row)):
+                cell = cells[cell_index]
+                cell.width = column_widths[cell_index]
+                if row_index % 2 == 1:
+                    shade_docx_cell(cell, "F5F9FF")
+                run = cell.paragraphs[0].add_run(str(value))
+                run.font.size = Pt(6.5)
 
     output = io.BytesIO()
-    workbook.save(output)
+    document.save(output)
+    output.seek(0)
+    return output
+
+
+def build_pdf(filters: dict) -> io.BytesIO:
+    rows = ordered_rows(filters)
+    output = io.BytesIO()
+    page_size = landscape(A4)
+    document = SimpleDocTemplate(
+        output,
+        pagesize=page_size,
+        leftMargin=12 * mm,
+        rightMargin=12 * mm,
+        topMargin=12 * mm,
+        bottomMargin=12 * mm,
+        title="Chemistry IP Survey Responses",
+        author="Chemistry IP",
+    )
+    title_style = ParagraphStyle(
+        "ExportTitle",
+        fontName="Helvetica-Bold",
+        fontSize=15,
+        leading=18,
+        textColor=rl_colors.HexColor("#0B2545"),
+        spaceAfter=3,
+    )
+    meta_style = ParagraphStyle(
+        "ExportMeta",
+        fontName="Helvetica",
+        fontSize=8,
+        leading=11,
+        textColor=rl_colors.HexColor("#41506B"),
+    )
+    header_style = ParagraphStyle(
+        "ExportHeader",
+        fontName="Helvetica-Bold",
+        fontSize=6.5,
+        leading=8,
+        textColor=rl_colors.white,
+    )
+    cell_style = ParagraphStyle(
+        "ExportCell",
+        fontName="Helvetica",
+        fontSize=6,
+        leading=7.5,
+        textColor=rl_colors.HexColor("#111827"),
+    )
+
+    def pdf_cell(value: str, style: ParagraphStyle) -> Paragraph:
+        text_value = xml_escape(str(value or "")).replace("\r\n", "\n").replace("\n", "<br/>")
+        return Paragraph(text_value or "&nbsp;", style)
+
+    story = [
+        Paragraph("Chemistry IP — Survey Responses", title_style),
+        Paragraph(
+            f"Generated {xml_escape(format_local(datetime.now(timezone.utc)))}"
+            f" · {len(rows)} response(s)",
+            meta_style,
+        ),
+        Paragraph(xml_escape(filters_summary(filters)), meta_style),
+        Spacer(1, 6),
+    ]
+
+    data: list[list] = [
+        [pdf_cell(header, header_style) for header in EXPORT_HEADERS]
+    ]
+    if rows:
+        for row in rows:
+            data.append([pdf_cell(value, cell_style) for value in export_row(row)])
+    else:
+        data.append(
+            [pdf_cell("No survey responses match the current filters.", cell_style)]
+            + [Paragraph("", cell_style) for _ in EXPORT_HEADERS[1:]]
+        )
+
+    usable_width = page_size[0] - 24 * mm
+    weight_total = sum(EXPORT_COLUMN_WEIGHTS)
+    column_widths = [
+        usable_width * weight / weight_total for weight in EXPORT_COLUMN_WEIGHTS
+    ]
+    table = Table(data, colWidths=column_widths, repeatRows=1)
+    table_style = [
+        ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#0B2545")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("GRID", (0, 0), (-1, -1), 0.25, rl_colors.HexColor("#C9D6E8")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.white, rl_colors.HexColor("#F5F9FF")]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 2),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+        ("TOPPADDING", (0, 0), (-1, -1), 1.5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
+    ]
+    if not rows:
+        table_style.append(("SPAN", (0, 1), (-1, 1)))
+    table.setStyle(TableStyle(table_style))
+    story.append(table)
+    document.build(story)
     output.seek(0)
     return output
 
@@ -3447,6 +3615,8 @@ body.charts-unavailable .chart-fallback { display: block; }
 .project-details > div:last-child { border-bottom: 0; }
 .project-details dt { color: var(--soft); font-size: 0.7rem; font-weight: 800; text-transform: uppercase; letter-spacing: .06em; padding-top: 2px; }
 .project-details dd { margin: 0; color: var(--ink); font-size: 0.84rem; }
+.project-details dd a { color: var(--navy); font-weight: 700; text-decoration: none; }
+.project-details dd a:hover { text-decoration: underline; }
 .credit-list { list-style: none; padding: 0; margin: 18px 0 0; display: grid; gap: 0; }
 .credit-list li { display: grid; grid-template-columns: 86px 1fr; gap: 12px; padding: 11px 0; border-bottom: 1px solid #edf4fa; }
 .credit-list li:last-child { border-bottom: 0; }
@@ -4310,7 +4480,8 @@ ADMIN_JS = r"""(function () {
     const prevButton = $("[data-page-prev]", adminRoot);
     const nextButton = $("[data-page-next]", adminRoot);
     const exportCsv = $("[data-export-csv]", adminRoot);
-    const exportXlsx = $("[data-export-xlsx]", adminRoot);
+    const exportPdf = $("[data-export-pdf]", adminRoot);
+    const exportDocx = $("[data-export-docx]", adminRoot);
     const dialog = $("[data-detail-dialog]", adminRoot);
     const detailBody = $("[data-detail-body]", adminRoot);
     let currentItems = new Map();
@@ -4353,7 +4524,8 @@ ADMIN_JS = r"""(function () {
       const query = queryParams(false).toString();
       const suffix = query ? "?" + query : "";
       if (exportCsv) exportCsv.href = "/admin/export.csv" + suffix;
-      if (exportXlsx) exportXlsx.href = "/admin/export.xlsx" + suffix;
+      if (exportPdf) exportPdf.href = "/admin/export.pdf" + suffix;
+      if (exportDocx) exportDocx.href = "/admin/export.docx" + suffix;
     }
 
     function renderTable(items, pagination) {
@@ -5249,6 +5421,20 @@ TOPIC_TEMPLATE = r"""
         <p class="small muted" style="margin-top:16px;">External photographs are loaded from Wikimedia Commons. If an image is unavailable, the page shows a styled fallback.</p>
       </div>
     </div>
+    <div class="card" id="development" style="margin-top:16px;">
+      <div class="kicker">Project development</div>
+      <h2 style="font-size:1.5rem;">Built and maintained by</h2>
+      <dl class="project-details">
+        <div>
+          <dt>Website</dt>
+          <dd>This site is developed by <a href="https://techorigin.online" target="_blank" rel="noopener noreferrer">techorigin.online</a></dd>
+        </div>
+        <div>
+          <dt>Developer</dt>
+          <dd>KAMLESHVAR · <a href="https://kamleshvar.online" target="_blank" rel="noopener noreferrer">kamleshvar.online</a></dd>
+        </div>
+      </dl>
+    </div>
   </section>
   {% endif %}
 {% endfor %}
@@ -5580,7 +5766,8 @@ ADMIN_TEMPLATE = r"""
     </div>
     <div class="admin-toolbar" style="margin:0;">
       <a class="btn btn-small btn-light" href="{{ url_for('export_csv') }}" data-export-csv>{{ icon('download') }} CSV</a>
-      <a class="btn btn-small btn-light" href="{{ url_for('export_xlsx') }}" data-export-xlsx>{{ icon('download') }} Excel</a>
+      <a class="btn btn-small btn-light" href="{{ url_for('export_pdf') }}" data-export-pdf>{{ icon('download') }} PDF</a>
+      <a class="btn btn-small btn-light" href="{{ url_for('export_docx') }}" data-export-docx>{{ icon('download') }} Word</a>
     </div>
   </div>
 
@@ -5931,19 +6118,37 @@ def export_csv():
     return response
 
 
-@app.get("/admin/export.xlsx")
-def export_xlsx():
+@app.get("/admin/export.docx")
+def export_docx():
     filters = parse_filters(request.args)
     try:
-        output = build_xlsx(filters)
+        output = build_docx(filters)
     except sqlite3.Error:
-        app.logger.exception("Could not export survey responses as Excel")
+        app.logger.exception("Could not export survey responses as Word document")
         return "Survey responses are temporarily unavailable.", 500
     response = send_file(
         output,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         as_attachment=True,
-        download_name="chemistry_ip_survey_responses.xlsx",
+        download_name="chemistry_ip_survey_responses.docx",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.get("/admin/export.pdf")
+def export_pdf():
+    filters = parse_filters(request.args)
+    try:
+        output = build_pdf(filters)
+    except sqlite3.Error:
+        app.logger.exception("Could not export survey responses as PDF")
+        return "Survey responses are temporarily unavailable.", 500
+    response = send_file(
+        output,
+        mimetype="application/pdf",
+        as_attachment=True,
+        download_name="chemistry_ip_survey_responses.pdf",
     )
     response.headers["Cache-Control"] = "no-store"
     return response
