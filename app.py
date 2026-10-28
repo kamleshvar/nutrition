@@ -12,6 +12,8 @@ the chart library; readable fallback tables are shown when it is unavailable.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import csv
 import hashlib
 import hmac
@@ -43,6 +45,7 @@ from markupsafe import Markup
 from docx import Document
 from docx.enum.section import WD_ORIENT
 from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
@@ -50,7 +53,16 @@ from reportlab.lib import colors as rl_colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.lib.utils import ImageReader
+from reportlab.platypus import (
+    Image,
+    PageBreak,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
 from xml.sax.saxutils import escape as xml_escape
 
 
@@ -3037,6 +3049,385 @@ def build_pdf(filters: dict) -> io.BytesIO:
     output.seek(0)
     return output
 
+
+def decode_chart_images(payload) -> dict[str, bytes]:
+    images: dict[str, bytes] = {}
+    if not isinstance(payload, dict):
+        return images
+    submitted = payload.get("charts")
+    if not isinstance(submitted, list):
+        return images
+    valid_keys = {definition["key"] for definition in CHART_DEFS}
+    for item in submitted[: len(valid_keys) + 5]:
+        if not isinstance(item, dict):
+            continue
+        key = item.get("key")
+        data = item.get("image")
+        if key not in valid_keys or not isinstance(data, str):
+            continue
+        if not data.startswith("data:image/png;base64,"):
+            continue
+        try:
+            raw = base64.b64decode(data.split(",", 1)[1], validate=True)
+        except (ValueError, binascii.Error):
+            continue
+        if 0 < len(raw) <= 4_000_000:
+            images[key] = raw
+    return images
+
+
+def chart_kind_label(chart: dict) -> str:
+    if chart.get("type") == "doughnut":
+        return "Doughnut chart"
+    return "Horizontal bar chart" if chart.get("horizontal") else "Bar chart"
+
+
+def chart_report_summary_rows(summary: dict) -> list[tuple[str, str]]:
+    return [
+        ("Total responses", str(summary["total"])),
+        ("Classes represented", str(summary["unique_classes"])),
+        ("Most preferred breakfast", summary["most_preferred_breakfast"]),
+        ("Most common frequency", summary["most_common_frequency"]),
+        ("Last response (IST)", summary["last_response_at"]),
+    ]
+
+
+def build_chart_report_pdf(images: dict[str, bytes]) -> io.BytesIO:
+    summary = build_summary()
+    charts = summary["charts"]
+    generated = format_local(datetime.now(timezone.utc))
+    output = io.BytesIO()
+    document = SimpleDocTemplate(
+        output,
+        pagesize=A4,
+        leftMargin=18 * mm,
+        rightMargin=18 * mm,
+        topMargin=16 * mm,
+        bottomMargin=18 * mm,
+        title="Chemistry IP — Aggregate Survey Charts",
+        author="Chemistry IP",
+    )
+    title_style = ParagraphStyle(
+        "ChartTitle",
+        fontName="Helvetica-Bold",
+        fontSize=18,
+        leading=22,
+        textColor=rl_colors.HexColor("#0B2545"),
+        spaceAfter=4,
+    )
+    heading_style = ParagraphStyle(
+        "ChartHeading",
+        fontName="Helvetica-Bold",
+        fontSize=14,
+        leading=17,
+        textColor=rl_colors.HexColor("#0B2545"),
+        spaceBefore=2,
+        spaceAfter=3,
+    )
+    meta_style = ParagraphStyle(
+        "ChartMeta",
+        fontName="Helvetica",
+        fontSize=8.5,
+        leading=11,
+        textColor=rl_colors.HexColor("#41506B"),
+    )
+    cell_style = ParagraphStyle(
+        "ChartCell",
+        fontName="Helvetica",
+        fontSize=8,
+        leading=10,
+        textColor=rl_colors.HexColor("#17263B"),
+    )
+    header_cell_style = ParagraphStyle(
+        "ChartHeaderCell",
+        fontName="Helvetica-Bold",
+        fontSize=8,
+        leading=10,
+        textColor=rl_colors.white,
+    )
+
+    story: list = [
+        Paragraph("Aggregate Survey Charts", title_style),
+        Paragraph(f"Chemistry IP · Generated {xml_escape(generated)}", meta_style),
+        Spacer(1, 8),
+        Paragraph(
+            "A structured report of every aggregate chart on the admin dashboard. "
+            "The report contains aggregate counts only — no names, emails, comments or "
+            "individual records are included.",
+            meta_style,
+        ),
+        Spacer(1, 10),
+        Paragraph("Survey overview", heading_style),
+    ]
+
+    summary_rows = [
+        [
+            Paragraph("Metric", header_cell_style),
+            Paragraph("Value", header_cell_style),
+        ]
+    ]
+    for label, value in chart_report_summary_rows(summary):
+        summary_rows.append(
+            [Paragraph(xml_escape(label), cell_style), Paragraph(xml_escape(str(value)), cell_style)]
+        )
+    summary_table = Table(summary_rows, colWidths=[58 * mm, document.width - 58 * mm])
+    summary_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#0B2545")),
+                ("GRID", (0, 0), (-1, -1), 0.4, rl_colors.HexColor("#C9D6E8")),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.white, rl_colors.HexColor("#F5F9FF")]),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ]
+        )
+    )
+    story.append(summary_table)
+
+    for index, definition in enumerate(CHART_DEFS, start=1):
+        chart = charts.get(definition["key"])
+        if not chart:
+            continue
+        story.append(PageBreak())
+        story.append(Paragraph(f"{index}. {xml_escape(definition['title'])}", heading_style))
+        story.append(
+            Paragraph(
+                xml_escape(f"{chart_kind_label(chart)} · {chart['total']} response(s)"),
+                meta_style,
+            )
+        )
+        story.append(Spacer(1, 6))
+        raw = images.get(definition["key"])
+        if raw:
+            try:
+                reader = ImageReader(io.BytesIO(raw))
+                pixel_width, pixel_height = reader.getSize()
+                max_width = document.width
+                max_height = 120 * mm
+                scale = min(max_width / pixel_width, max_height / pixel_height)
+                story.append(
+                    Image(
+                        io.BytesIO(raw),
+                        width=pixel_width * scale,
+                        height=pixel_height * scale,
+                    )
+                )
+                story.append(Spacer(1, 8))
+            except Exception:
+                app.logger.exception("Could not embed chart image in PDF report")
+
+        table_rows = [
+            [
+                Paragraph("Option", header_cell_style),
+                Paragraph("Responses", header_cell_style),
+                Paragraph("Share", header_cell_style),
+            ]
+        ]
+        for label, count, percentage in zip(
+            chart["labels"], chart["counts"], chart["percentages"]
+        ):
+            table_rows.append(
+                [
+                    Paragraph(xml_escape(str(label)), cell_style),
+                    Paragraph(str(count), cell_style),
+                    Paragraph(f"{percentage}%", cell_style),
+                ]
+            )
+        table_rows.append(
+            [
+                Paragraph("<b>Total</b>", cell_style),
+                Paragraph(f"<b>{chart['total']}</b>", cell_style),
+                Paragraph("<b>100%</b>" if chart["total"] else "<b>0%</b>", cell_style),
+            ]
+        )
+        data_table = Table(
+            table_rows,
+            colWidths=[document.width - 40 * mm, 20 * mm, 20 * mm],
+            repeatRows=1,
+        )
+        data_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#0B2545")),
+                    ("GRID", (0, 0), (-1, -1), 0.4, rl_colors.HexColor("#C9D6E8")),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -2), [rl_colors.white, rl_colors.HexColor("#F5F9FF")]),
+                    ("BACKGROUND", (0, -1), (-1, -1), rl_colors.HexColor("#EAF1FF")),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                    ("TOPPADDING", (0, 0), (-1, -1), 3),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ]
+            )
+        )
+        story.append(data_table)
+
+    def draw_footer(canvas, doc) -> None:
+        canvas.saveState()
+        canvas.setStrokeColor(rl_colors.HexColor("#D8E7F5"))
+        canvas.setLineWidth(0.5)
+        canvas.line(18 * mm, 14 * mm, A4[0] - 18 * mm, 14 * mm)
+        canvas.setFont("Helvetica", 7)
+        canvas.setFillColor(rl_colors.HexColor("#5F7087"))
+        canvas.drawString(18 * mm, 10 * mm, "Chemistry IP — Aggregate Survey Charts")
+        canvas.drawRightString(
+            A4[0] - 18 * mm, 10 * mm, f"Page {canvas.getPageNumber()}"
+        )
+        canvas.restoreState()
+
+    document.build(story, onFirstPage=draw_footer, onLaterPages=draw_footer)
+    output.seek(0)
+    return output
+
+
+def add_docx_page_number_footer(document) -> None:
+    footer = document.sections[0].footer
+    paragraph = footer.paragraphs[0]
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = paragraph.add_run("Chemistry IP — Aggregate Survey Charts · Page ")
+    run.font.size = Pt(8)
+    field_run = paragraph.add_run()
+    field_run.font.size = Pt(8)
+    begin = OxmlElement("w:fldChar")
+    begin.set(qn("w:fldCharType"), "begin")
+    instruction = OxmlElement("w:instrText")
+    instruction.set(qn("xml:space"), "preserve")
+    instruction.text = " PAGE "
+    end = OxmlElement("w:fldChar")
+    end.set(qn("w:fldCharType"), "end")
+    field_run._r.append(begin)
+    field_run._r.append(instruction)
+    field_run._r.append(end)
+
+
+def build_chart_report_docx(images: dict[str, bytes]) -> io.BytesIO:
+    summary = build_summary()
+    charts = summary["charts"]
+    document = Document()
+    section = document.sections[0]
+    section.page_width = Cm(21.0)
+    section.page_height = Cm(29.7)
+    for margin in ("left_margin", "right_margin"):
+        setattr(section, margin, Cm(1.9))
+    section.top_margin = Cm(1.7)
+    section.bottom_margin = Cm(1.7)
+    add_docx_page_number_footer(document)
+
+    title = document.add_paragraph()
+    title_run = title.add_run("Aggregate Survey Charts")
+    title_run.font.size = Pt(20)
+    title_run.font.bold = True
+    title_run.font.color.rgb = RGBColor(0x0B, 0x25, 0x45)
+
+    meta = document.add_paragraph()
+    meta_run = meta.add_run(
+        f"Chemistry IP · Generated {format_local(datetime.now(timezone.utc))}"
+    )
+    meta_run.font.size = Pt(9)
+    meta_run.font.color.rgb = RGBColor(0x41, 0x50, 0x6B)
+
+    note = document.add_paragraph()
+    note_run = note.add_run(
+        "A structured report of every aggregate chart on the admin dashboard. "
+        "The report contains aggregate counts only — no names, emails, comments or "
+        "individual records are included."
+    )
+    note_run.font.size = Pt(9)
+    note_run.font.color.rgb = RGBColor(0x41, 0x50, 0x6B)
+
+    overview_heading = document.add_paragraph()
+    overview_run = overview_heading.add_run("Survey overview")
+    overview_run.font.size = Pt(14)
+    overview_run.font.bold = True
+    overview_run.font.color.rgb = RGBColor(0x0B, 0x25, 0x45)
+
+    summary_table = document.add_table(rows=1, cols=2)
+    summary_table.style = "Table Grid"
+    summary_table.autofit = False
+    summary_widths = (Cm(6.0), Cm(11.2))
+    for index, header in enumerate(("Metric", "Value")):
+        cell = summary_table.rows[0].cells[index]
+        cell.width = summary_widths[index]
+        shade_docx_cell(cell, "0B2545")
+        run = cell.paragraphs[0].add_run(header)
+        run.font.size = Pt(8.5)
+        run.font.bold = True
+        run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+    for row_index, (label, value) in enumerate(chart_report_summary_rows(summary)):
+        cells = summary_table.add_row().cells
+        for index, text_value in enumerate((label, value)):
+            cells[index].width = summary_widths[index]
+            if row_index % 2 == 1:
+                shade_docx_cell(cells[index], "F5F9FF")
+            run = cells[index].paragraphs[0].add_run(str(text_value))
+            run.font.size = Pt(8.5)
+
+    for index, definition in enumerate(CHART_DEFS, start=1):
+        chart = charts.get(definition["key"])
+        if not chart:
+            continue
+        document.add_page_break()
+        heading = document.add_paragraph()
+        heading_run = heading.add_run(f"{index}. {definition['title']}")
+        heading_run.font.size = Pt(14)
+        heading_run.font.bold = True
+        heading_run.font.color.rgb = RGBColor(0x0B, 0x25, 0x45)
+
+        subtitle = document.add_paragraph()
+        subtitle_run = subtitle.add_run(
+            f"{chart_kind_label(chart)} · {chart['total']} response(s)"
+        )
+        subtitle_run.font.size = Pt(8.5)
+        subtitle_run.font.color.rgb = RGBColor(0x41, 0x50, 0x6B)
+
+        raw = images.get(definition["key"])
+        if raw:
+            try:
+                document.add_picture(io.BytesIO(raw), width=Cm(16.4))
+                document.add_paragraph()
+            except Exception:
+                app.logger.exception("Could not embed chart image in Word report")
+
+        table = document.add_table(rows=1, cols=3)
+        table.style = "Table Grid"
+        table.autofit = False
+        column_widths = (Cm(10.4), Cm(3.0), Cm(3.0))
+        for column_index, header in enumerate(("Option", "Responses", "Share")):
+            cell = table.rows[0].cells[column_index]
+            cell.width = column_widths[column_index]
+            shade_docx_cell(cell, "0B2545")
+            run = cell.paragraphs[0].add_run(header)
+            run.font.size = Pt(8.5)
+            run.font.bold = True
+            run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+
+        body_rows = list(zip(chart["labels"], chart["counts"], chart["percentages"]))
+        for row_index, (label, count, percentage) in enumerate(body_rows):
+            cells = table.add_row().cells
+            for column_index, text_value in enumerate((label, count, f"{percentage}%")):
+                cells[column_index].width = column_widths[column_index]
+                if row_index % 2 == 1:
+                    shade_docx_cell(cells[column_index], "F5F9FF")
+                run = cells[column_index].paragraphs[0].add_run(str(text_value))
+                run.font.size = Pt(8.5)
+
+        total_cells = table.add_row().cells
+        total_values = ("Total", chart["total"], "100%" if chart["total"] else "0%")
+        for column_index, text_value in enumerate(total_values):
+            total_cells[column_index].width = column_widths[column_index]
+            shade_docx_cell(total_cells[column_index], "EAF1FF")
+            run = total_cells[column_index].paragraphs[0].add_run(str(text_value))
+            run.font.size = Pt(8.5)
+            run.font.bold = True
+
+    output = io.BytesIO()
+    document.save(output)
+    output.seek(0)
+    return output
+
 # ---------------------------------------------------------------------------
 # Embedded styles and behaviour
 # ---------------------------------------------------------------------------
@@ -4382,7 +4773,7 @@ BASE_JS = r"""(function () {
     });
   }
 
-  window.NutriLab = { $, $$, setText, fetchSummary, renderSummaryCards, renderCharts, showChartError };
+  window.NutriLab = { $, $$, setText, fetchSummary, renderSummaryCards, renderCharts, chartInstances, showChartError };
 
   /* If Chart.js failed to load, still show fallbacks after data arrives. */
   if (typeof window.Chart === "undefined") {
@@ -4456,7 +4847,7 @@ LIVE_JS = r"""(function () {
 
 ADMIN_JS = r"""(function () {
   "use strict";
-  const { $, $$, setText, fetchSummary, renderSummaryCards, renderCharts } = window.NutriLab;
+  const { $, $$, setText, fetchSummary, renderSummaryCards, renderCharts, chartInstances } = window.NutriLab;
 
 /* Admin dashboard */
   const adminRoot = $("[data-admin]");
@@ -4482,6 +4873,8 @@ ADMIN_JS = r"""(function () {
     const exportCsv = $("[data-export-csv]", adminRoot);
     const exportPdf = $("[data-export-pdf]", adminRoot);
     const exportDocx = $("[data-export-docx]", adminRoot);
+    const exportChartsPdf = $("[data-export-charts-pdf]", adminRoot);
+    const exportChartsDocx = $("[data-export-charts-docx]", adminRoot);
     const dialog = $("[data-detail-dialog]", adminRoot);
     const detailBody = $("[data-detail-body]", adminRoot);
     let currentItems = new Map();
@@ -4526,6 +4919,66 @@ ADMIN_JS = r"""(function () {
       if (exportCsv) exportCsv.href = "/admin/export.csv" + suffix;
       if (exportPdf) exportPdf.href = "/admin/export.pdf" + suffix;
       if (exportDocx) exportDocx.href = "/admin/export.docx" + suffix;
+    }
+
+    function collectChartImages() {
+      const charts = [];
+      $$("[data-chart-card]", adminRoot).forEach((card) => {
+        const key = card.dataset.chartCard;
+        const canvas = $("[data-chart-canvas]", card);
+        const instance = canvas ? chartInstances.get(canvas.id) : null;
+        let image = "";
+        if (instance && typeof instance.toBase64Image === "function") {
+          try {
+            image = instance.toBase64Image("image/png", 1);
+          } catch (error) {
+            image = "";
+          }
+        }
+        charts.push({ key, image });
+      });
+      return charts;
+    }
+
+    async function downloadChartReport(format, button) {
+      if (!button) return;
+      button.disabled = true;
+      try {
+        const response = await fetch("/admin/export.charts." + format, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "*/*" },
+          body: JSON.stringify({ charts: collectChartImages() }),
+        });
+        if (!response.ok) throw new Error("Chart report request failed");
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = "chemistry_ip_aggregate_charts." + format;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 2000);
+      } catch (error) {
+        if (errorBox) {
+          errorBox.textContent =
+            "The aggregate chart report could not be generated. Please try again.";
+          errorBox.classList.add("visible");
+        }
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    if (exportChartsPdf) {
+      exportChartsPdf.addEventListener("click", () => {
+        downloadChartReport("pdf", exportChartsPdf);
+      });
+    }
+    if (exportChartsDocx) {
+      exportChartsDocx.addEventListener("click", () => {
+        downloadChartReport("docx", exportChartsDocx);
+      });
     }
 
     function renderTable(items, pagination) {
@@ -5742,7 +6195,11 @@ ADMIN_TEMPLATE = r"""
       <h2>Aggregate charts</h2>
       <p>The same public aggregates, shown for convenience.</p>
     </div>
-    <span class="small muted">Updated <span data-generated-at>—</span></span>
+    <div class="admin-toolbar" style="margin:0; justify-content:flex-end;">
+      <span class="small muted">Updated <span data-generated-at>—</span></span>
+      <button type="button" class="btn btn-small btn-light" data-export-charts-pdf>{{ icon('download') }} Charts PDF</button>
+      <button type="button" class="btn btn-small btn-light" data-export-charts-docx>{{ icon('download') }} Charts Word</button>
+    </div>
   </div>
   <div class="chart-grid admin-chart-grid">
     {% for chart in chart_defs %}
@@ -6149,6 +6606,42 @@ def export_pdf():
         mimetype="application/pdf",
         as_attachment=True,
         download_name="chemistry_ip_survey_responses.pdf",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.post("/admin/export.charts.pdf")
+def export_charts_pdf():
+    images = decode_chart_images(request.get_json(silent=True))
+    try:
+        output = build_chart_report_pdf(images)
+    except sqlite3.Error:
+        app.logger.exception("Could not export aggregate charts as PDF")
+        return "Survey responses are temporarily unavailable.", 500
+    response = send_file(
+        output,
+        mimetype="application/pdf",
+        as_attachment=True,
+        download_name="chemistry_ip_aggregate_charts.pdf",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.post("/admin/export.charts.docx")
+def export_charts_docx():
+    images = decode_chart_images(request.get_json(silent=True))
+    try:
+        output = build_chart_report_docx(images)
+    except sqlite3.Error:
+        app.logger.exception("Could not export aggregate charts as Word document")
+        return "Survey responses are temporarily unavailable.", 500
+    response = send_file(
+        output,
+        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        as_attachment=True,
+        download_name="chemistry_ip_aggregate_charts.docx",
     )
     response.headers["Cache-Control"] = "no-store"
     return response
